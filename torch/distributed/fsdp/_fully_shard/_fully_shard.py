@@ -11,6 +11,8 @@ from typing_extensions import deprecated
 import torch
 import torch.nn as nn
 from torch.distributed._composable import contract
+from torch.distributed.device_mesh import _get_device_handle
+from torch.distributed.tensor import DTensor
 
 from ._fsdp_api import (
     AllGather,
@@ -1108,7 +1110,33 @@ class FSDPModule:
                 # parameter and attach it before FSDP restores grad_dtype.
                 saved_grads[fsdp_param] = grad
                 param.grad = None
-        ret = super()._apply(fn, recurse=recurse)  # type: ignore[misc]
+        params_by_id = {id(p.sharded_param): p for p in fsdp_params}
+
+        def apply_fn(tensor: torch.Tensor) -> torch.Tensor:
+            fsdp_param = params_by_id.get(id(tensor))
+            if fsdp_param is None:
+                return fn(tensor)
+            # Keep the source local tensor alive across the conversion, which
+            # may replace the DTensor's storage in Module._apply.
+            source = fsdp_param._sharded_local_tensor
+            source_stream = None
+            if source.device.type not in ("cpu", "meta") and source.numel() > 0:
+                source_stream = _get_device_handle(source.device.type).current_stream(
+                    source.device
+                )
+            result = fn(tensor)
+            local_tensor = cast(DTensor, result)._local_tensor
+            if source_stream is not None and local_tensor.device.type == "cpu":
+                # D2H changes storage, so reset_sharded_param will re-pad an
+                # uneven shard. Both re-padding and pinning read on the CPU
+                # and must wait for the copy on the actual source stream.
+                if local_tensor.size() != fsdp_param.padded_sharded_param_size or (
+                    fsdp_param.pin_memory and not local_tensor.is_pinned()
+                ):
+                    source_stream.synchronize()
+            return result
+
+        ret = super()._apply(apply_fn if fsdp_params else fn, recurse=recurse)  # type: ignore[misc]
         with torch.no_grad():
             for fsdp_param in fsdp_params:
                 fsdp_param.reset_sharded_param()

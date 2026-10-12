@@ -36,16 +36,18 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
 )
 from torch.distributed.tensor.placement_types import _StridedShard
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import (
     FSDPTest,
+    FSDPTestContinuous,
     FSDPTestMultiThread,
     get_devtype,
     MLP,
     patch_all_gather,
     patch_reduce_scatter,
 )
-from torch.testing._internal.common_utils import run_tests
+from torch.testing._internal.common_utils import parametrize, run_tests
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     ModelArgs,
     Transformer,
@@ -1518,6 +1520,110 @@ class TestFullyShardNonFloatParam(FSDPTest):
         ):
             loss = model(x).sum()
             loss.backward()
+
+
+class TestFullyShardCPUConversion(FSDPTestContinuous):
+    world_size = 2
+
+    @skip_if_lt_x_gpu(2)
+    @parametrize("rows", [8, 7, 1])
+    @parametrize("non_blocking", [False, True])
+    @parametrize("use_side_stream", [False, True])
+    def test_to_cpu(self, device, rows, non_blocking, use_side_stream):
+        device = torch.device(torch.device(device).type, self.rank)
+        device_module = torch.get_device_module(device)
+        mesh = init_device_mesh(device.type, (self.world_size,))
+        # Exercise a nested group with shared weights and a root-owned weight.
+        child = nn.Sequential(
+            nn.Linear(262144, rows, bias=False, device=device),
+            nn.Linear(262144, rows, bias=False, device=device),
+        )
+        child[1].weight = child[0].weight
+        model = nn.Sequential(child, nn.Linear(262144, rows, bias=False, device=device))
+        fully_shard(child, mesh=mesh)
+        fully_shard(model, mesh=mesh)
+        params = list(model.parameters())
+        specs = [param._spec for param in params]
+        fsdp_params = [
+            param
+            for module in (child, model)
+            for group in module._get_fsdp_state()._fsdp_param_groups
+            for param in group.fsdp_params
+        ]
+        stream = (
+            device_module.Stream(device=device)
+            if use_side_stream
+            else device_module.current_stream(device)
+        )
+        left = torch.ones((2048, 2048), dtype=torch.float16, device=device)
+        right = torch.ones_like(left)
+        product = torch.empty_like(left)
+        torch.mm(left, right, out=product)
+        device_module.synchronize(device)
+
+        with torch.no_grad():
+            for trial in range(2):
+                # Retain the sources to isolate readiness from allocator reuse.
+                sources = [param.to_local() for param in params]
+                expected = []
+                for index, source in enumerate(sources):
+                    value = 1000 * rows + 100 * self.rank + 10 * trial + index + 1
+                    source.fill_(value)
+                    reference = source.detach().cpu().clone()
+                    self.assertEqual(
+                        reference, torch.full_like(reference, value), rtol=0, atol=0
+                    )
+                    expected.append(reference)
+                device_module.synchronize(device)
+                with device_module.stream(stream):
+                    # Queue prewarmed compute to expose the D2H/CPU-copy race.
+                    # No host sleeps, tensor reads, or collectives in this window.
+                    for _ in range(64):
+                        torch.mm(left, right, out=product)
+                    model.to("cpu", non_blocking=non_blocking)
+                stream.synchronize()
+
+                self.assertIs(child[0].weight, child[1].weight)
+                for param, original, spec, reference, fsdp_param in zip(
+                    model.parameters(), params, specs, expected, fsdp_params
+                ):
+                    self.assertIs(param, original)
+                    self.assertEqual(param._spec, spec)
+                    self.assertEqual(param.device, torch.device("cpu"))
+                    local = param.to_local()
+                    self.assertEqual(local, reference, rtol=0, atol=0)
+                    padded = fsdp_param._sharded_param_data.view(
+                        fsdp_param.padded_sharded_param_size
+                    )
+                    self.assertEqual(
+                        padded.untyped_storage().data_ptr(),
+                        local.untyped_storage().data_ptr(),
+                    )
+                    self.assertEqual(
+                        padded[: local.size(0)], reference, rtol=0, atol=0
+                    )
+                    self.assertEqual(
+                        padded[local.size(0) :],
+                        torch.zeros_like(padded[local.size(0) :]),
+                        rtol=0,
+                        atol=0,
+                    )
+
+                model.to(device, non_blocking=non_blocking)
+                device_module.synchronize(device)
+                self.assertIs(child[0].weight, child[1].weight)
+                for param, original, spec, reference in zip(
+                    model.parameters(), params, specs, expected
+                ):
+                    self.assertIs(param, original)
+                    self.assertEqual(param._spec, spec)
+                    self.assertEqual(param.device, device)
+                    self.assertEqual(param.to_local().cpu(), reference, rtol=0, atol=0)
+
+
+instantiate_device_type_tests(
+    TestFullyShardCPUConversion, globals(), except_for="cpu", allow_xpu=True
+)
 
 
 if __name__ == "__main__":
